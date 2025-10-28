@@ -1,0 +1,146 @@
+import streamlit as st
+import paramiko
+import sqlite3
+import pandas as pd
+from datetime import datetime
+import stat
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+st.set_page_config(page_title="Remote Linux File Stats (SFTP)", layout="wide")
+st.title("Remote Linux File Stats Viewer (Parallel SFTP)")
+
+# Sidebar
+st.sidebar.header("Connect to Remote Server")
+hostname = st.sidebar.text_input("Hostname", placeholder="Enter hostname")
+username = st.sidebar.text_input("Username", placeholder="Enter username")
+password = st.sidebar.text_input("Password", placeholder="Enter password", type="password")
+parent_path = st.sidebar.text_input("Parent Directory", placeholder="Enter parent directory")
+extensions = st.sidebar.text_input("File Extensions (comma-separated, e.g., .log,.txt)", placeholder="Enter extensions (optional)").split(",")
+extensions = [ext.strip() for ext in extensions if ext.strip()] or None
+connect_btn = st.sidebar.button("Connect and Fetch Data")
+
+# Database functions
+def init_db():
+    conn = sqlite3.connect("file_stats.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            total_files INTEGER,
+            min_size REAL,
+            max_size REAL
+        )
+    """)
+    conn.commit()
+    return conn
+
+def save_snapshot(conn, total_files, min_size, max_size):
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO snapshots (timestamp, total_files, min_size, max_size) VALUES (?, ?, ?, ?)",
+                  (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), total_files, min_size, max_size))
+    conn.commit()
+
+def get_snapshots(conn):
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM snapshots ORDER BY id DESC LIMIT 5")
+    return cursor.fetchall()
+
+# Parallelized SFTP data collection
+def collect_folder_data_sftp(sftp, path, extensions=None):
+    folder_summary = []
+    file_details = []
+    try:
+        items = sftp.listdir_attr(path)
+    except Exception as e:
+        st.error(f"Error accessing {path}: {e}")
+        return pd.DataFrame(), pd.DataFrame()
+    
+    file_sizes = []
+    subdirs = []
+    for item in items:
+        full_path = f"{path.rstrip('/')}/{item.filename}"
+        if stat.S_ISDIR(item.st_mode):
+            subdirs.append(full_path)
+        elif stat.S_ISREG(item.st_mode):
+            if extensions and not any(item.filename.endswith(ext) for ext in extensions):
+                continue
+            size_kb = round(item.st_size / 1024.0, 2)
+            file_sizes.append(size_kb)
+            file_details.append({
+                "Folder Path": path,
+                "File Name": item.filename,
+                "File Size (KB)": size_kb
+            })
+    
+    if file_sizes:
+        folder_summary.append({
+            "Folder Path": path,
+            "File Count": len(file_sizes),
+            "Min File Size (KB)": min(file_sizes),
+            "Max File Size (KB)": max(file_sizes)
+        })
+    
+    df_folder = pd.DataFrame(folder_summary)
+    df_files = pd.DataFrame(file_details)
+    
+    # Parallelize subdirectory processing
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        future_to_subdir = {
+            executor.submit(collect_folder_data_sftp, sftp, subdir, extensions): subdir
+            for subdir in subdirs
+        }
+        for future in as_completed(future_to_subdir):
+            sub_df_folder, sub_df_files = future.result()
+            df_folder = pd.concat([df_folder, sub_df_folder], ignore_index=True)
+            df_files = pd.concat([df_files, sub_df_files], ignore_index=True)
+    
+    return df_folder, df_files
+
+# Main logic
+if connect_btn:
+    if not all([hostname, username, password, parent_path]):
+        st.error("Please fill in all connection details.")
+    else:
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        try:
+            st.info(f"Connecting to {hostname}...")
+            ssh.connect(hostname, username=username, password=password)
+            sftp = ssh.open_sftp()
+            st.success(f"Connected to {hostname}")
+            
+            with st.spinner("Fetching folder and file details..."):
+                folder_summary, file_details = collect_folder_data_sftp(sftp, parent_path, extensions)
+            
+            if not folder_summary.empty:
+                st.subheader("Folder Summary")
+                st.dataframe(folder_summary, use_container_width=True)
+                total_files = folder_summary["File Count"].sum()
+                min_size = folder_summary["Min File Size (KB)"].min()
+                max_size = folder_summary["Max File Size (KB)"].max()
+                st.metric("Total Files", f"{total_files}")
+                st.metric("Min File Size (KB)", f"{min_size}")
+                st.metric("Max File Size (KB)", f"{max_size}")
+                
+                conn = init_db()
+                save_snapshot(conn, total_files, min_size, max_size)
+                
+                st.subheader("Last 5 Snapshots")
+                snapshots = get_snapshots(conn)
+                if snapshots:
+                    df_snapshots = pd.DataFrame(snapshots, columns=["ID", "Timestamp", "Total Files", "Min File Size (KB)", "Max File Size (KB)"])
+                    st.dataframe(df_snapshots, use_container_width=True)
+            
+            if not file_details.empty:
+                st.subheader("File Details")
+                st.dataframe(file_details, use_container_width=True)
+            else:
+                st.error("No data retrieved. Check path or permissions.")
+            
+            sftp.close()
+        
+        except Exception as e:
+            st.error(f"Connection failed: {e}")
+        finally:
+            ssh.close()
