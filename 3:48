@@ -1,0 +1,193 @@
+import streamlit as st
+import paramiko
+import sqlite3
+import pandas as pd
+from datetime import datetime, timedelta
+
+st.set_page_config(page_title="Remote File Counts Viewer", layout="wide")
+st.title("Remote File Counts Viewer (SSH Command)")
+
+# Sidebar
+st.sidebar.header("Connect to Remote Server")
+hostname = st.sidebar.text_input("Hostname", placeholder="Enter hostname")
+username = st.sidebar.text_input("Username", placeholder="Enter username")
+password = st.sidebar.text_input("Password", placeholder="Enter password", type="password")
+parent_path = st.sidebar.text_input("Parent Directory", placeholder="Enter parent directory (e.g., /var/log)")
+connect_btn = st.sidebar.button("Connect and Fetch Data")
+
+# Database functions
+def init_db():
+    with sqlite3.connect("file_counts.db", timeout=10) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS folder_counts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                hostname TEXT,
+                folder_path TEXT,
+                run_date TEXT,
+                file_count INTEGER,
+                UNIQUE(hostname, folder_path, run_date) ON CONFLICT REPLACE
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS file_details (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                hostname TEXT,
+                file_path TEXT,
+                run_date TEXT,
+                UNIQUE(hostname, file_path, run_date) ON CONFLICT REPLACE
+            )
+        """)
+        conn.commit()
+    return sqlite3.connect("file_counts.db", timeout=10)
+
+def save_folder_counts(conn, hostname, folder_counts, run_date):
+    with conn:
+        cursor = conn.cursor()
+        for folder, count in folder_counts.items():
+            cursor.execute("INSERT INTO folder_counts (hostname, folder_path, run_date, file_count) VALUES (?, ?, ?, ?)",
+                          (hostname, folder, run_date, count))
+        conn.commit()
+    st.write(f"Saved {len(folder_counts)} folder counts for {run_date}")
+
+def save_file_details(conn, hostname, file_paths, run_date):
+    with conn:
+        cursor = conn.cursor()
+        for file_path in file_paths:
+            cursor.execute("INSERT INTO file_details (hostname, file_path, run_date) VALUES (?, ?, ?)",
+                          (hostname, file_path, run_date))
+        conn.commit()
+    st.write(f"Saved {len(file_paths)} file details for {run_date}")
+
+def get_folder_counts_table(conn, hostname):
+    cursor = conn.cursor()
+    cursor.execute("SELECT DISTINCT folder_path FROM folder_counts WHERE hostname = ?", (hostname,))
+    all_folders = [row[0] for row in cursor.fetchall()]
+    if not all_folders:
+        return pd.DataFrame()
+
+    # Get the last 5 unique run dates, newest first
+    cursor.execute("SELECT DISTINCT run_date FROM folder_counts WHERE hostname = ? ORDER BY run_date DESC LIMIT 5", (hostname,))
+    date_rows = cursor.fetchall()
+    date_range = [row[0] for row in date_rows]  # Last 5 days, newest first
+
+    data = []
+    for folder in all_folders:
+        row = [folder]
+        for date in date_range:
+            cursor.execute("SELECT file_count FROM folder_counts WHERE hostname = ? AND folder_path = ? AND run_date = ?",
+                          (hostname, folder, date))
+            count = cursor.fetchone()
+            row.append(count[0] if count else 0)
+        data.append(row)
+    
+    columns = ["Folder Path"] + [date.strftime("%d %b %Y") for date in pd.to_datetime(date_range)]
+    return pd.DataFrame(data, columns=columns)
+
+def get_folder_summary(conn, hostname, run_date):
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT folder_path, file_count 
+        FROM folder_counts 
+        WHERE hostname = ? AND run_date = ?""", (hostname, run_date))
+    rows = cursor.fetchall()
+    if not rows:
+        return pd.DataFrame()
+    
+    data = {"Folder Path": [], "File Count": []}
+    for folder, count in rows:
+        data["Folder Path"].append(folder)
+        data["File Count"].append(count)
+    return pd.DataFrame(data)
+
+def get_file_details_table(conn, hostname, run_date):
+    cursor = conn.cursor()
+    cursor.execute("SELECT file_path FROM file_details WHERE hostname = ? AND run_date = ?", (hostname, run_date))
+    file_paths = [row[0] for row in cursor.fetchall()]
+    if not file_paths:
+        return pd.DataFrame()
+    
+    data = {"File Path": file_paths}
+    return pd.DataFrame(data)
+
+# SSH command-based data collection
+def collect_data_ssh(ssh, path):
+    try:
+        command = f"find '{path}' -type f"
+        st.write(f"Executing SSH command: {command}")
+        stdin, stdout, stderr = ssh.exec_command(command)
+        output = stdout.read().decode().strip().split("\n")
+        error = stderr.read().decode().strip()
+        if error:
+            st.error(f"SSH command error: {error}")
+            return None, None
+
+        folder_counts = {}
+        file_paths = []
+        for line in output:
+            if line:  # Skip empty lines
+                file_paths.append(line)
+                folder = "/".join(line.strip().split("/")[:-1]) or "/"
+                folder_counts[folder] = folder_counts.get(folder, 0) + 1
+        
+        st.write(f"Collected {len(file_paths)} files across {len(folder_counts)} folders")
+        return folder_counts, file_paths
+    except Exception as e:
+        st.error(f"SSH command failed: {e}. Check path, permissions, or ensure 'find' is available on the server.")
+        return None, None
+
+# Main logic
+if connect_btn:
+    if not all([hostname, username, password, parent_path]):
+        st.error("Please fill in all connection details.")
+    else:
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        try:
+            st.info(f"Attempting to connect to {hostname}...")
+            ssh.connect(hostname, username=username, password=password)
+            st.success(f"Connected to {hostname}")
+            
+            with st.spinner("Fetching data..."):
+                folder_counts, file_paths = collect_data_ssh(ssh, parent_path)
+            
+            if folder_counts and file_paths:
+                conn = init_db()
+                run_date = datetime.now().strftime("%Y-%m-%d")
+                save_folder_counts(conn, hostname, folder_counts, run_date)
+                save_file_details(conn, hostname, file_paths, run_date)
+                
+                st.subheader("Folder File Counts by Date")
+                df_folder_counts = get_folder_counts_table(conn, hostname)
+                if not df_folder_counts.empty:
+                    st.dataframe(df_folder_counts, use_container_width=True)
+                else:
+                    st.warning("No folder counts available yet. This is the first run; data will build up over time.")
+
+                st.subheader("Folder Summary")
+                df_folder_summary = get_folder_summary(conn, hostname, run_date)
+                if not df_folder_summary.empty:
+                    st.dataframe(df_folder_summary, use_container_width=True)
+                else:
+                    st.warning("No folder summary available for this run.")
+
+                st.subheader("File Details")
+                df_file_details = get_file_details_table(conn, hostname, run_date)
+                if not df_file_details.empty:
+                    st.dataframe(df_file_details, use_container_width=True)
+                else:
+                    st.warning("No file details available for this run.")
+            else:
+                st.error("No data retrieved. Verify the path exists, check permissions, and ensure 'find' is available on the server.")
+        
+        except Exception as e:
+            if "getaddrinfo failed" in str(e).lower():
+                st.error(f"Connection failed: Unable to resolve hostname '{hostname}'. Please check for typos, ensure the server is online, or use an IP address. Test with 'ping {hostname}' or 'nslookup {hostname}'.")
+            else:
+                st.error(f"Connection failed: {e}")
+        finally:
+            ssh.close()
+
+# Close any open connection on script exit
+if 'conn' in locals():
+    conn.close()
