@@ -1,0 +1,193 @@
+import streamlit as st
+import paramiko
+import sqlite3
+import pandas as pd
+from datetime import datetime
+
+st.set_page_config(page_title="Remote Linux File Stats (SSH)", layout="wide")
+st.title("Remote Linux File Stats Viewer (SSH Command)")
+
+# Sidebar
+st.sidebar.header("Connect to Remote Server")
+hostname = st.sidebar.text_input("Hostname", placeholder="Enter hostname")
+username = st.sidebar.text_input("Username", placeholder="Enter username")
+password = st.sidebar.text_input("Password", placeholder="Enter password", type="password")
+parent_path = st.sidebar.text_input("Parent Directory", placeholder="Enter parent directory (e.g., /var/log)")
+extensions = st.sidebar.text_input("File Extensions (comma-separated, e.g., .log,.txt)", placeholder="Enter extensions (optional)").split(",")
+extensions = [ext.strip() for ext in extensions if ext.strip()] or None
+connect_btn = st.sidebar.button("Connect and Fetch Data")
+
+# Database functions
+def init_db():
+    conn = sqlite3.connect("file_stats.db")
+    cursor = conn.cursor()
+    # Snapshots table for aggregate stats
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            hostname TEXT,
+            total_files INTEGER,
+            min_size REAL,
+            max_size REAL
+        )
+    """)
+    # Folder stats table for per-folder counts by date
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS folder_stats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            hostname TEXT,
+            folder_path TEXT,
+            file_count INTEGER,
+            FOREIGN KEY (hostname) REFERENCES snapshots(hostname)
+        )
+    """)
+    # Index for faster queries
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_timestamp_folder ON folder_stats (timestamp)")
+    conn.commit()
+    return conn
+
+def save_snapshot(conn, hostname, total_files, min_size, max_size, folder_stats):
+    cursor = conn.cursor()
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # Save aggregate stats
+    cursor.execute("INSERT INTO snapshots (timestamp, hostname, total_files, min_size, max_size) VALUES (?, ?, ?, ?, ?)",
+                   (timestamp, hostname, int(total_files), min_size, max_size))
+    # Save folder stats
+    for folder, count in folder_stats.items():
+        cursor.execute("INSERT INTO folder_stats (timestamp, hostname, folder_path, file_count) VALUES (?, ?, ?, ?)",
+                       (timestamp, hostname, folder, count))
+    conn.commit()
+    st.write(f"Saved snapshot and {len(folder_stats)} folder stats for timestamp {timestamp}")
+
+def get_snapshots(conn):
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM snapshots ORDER BY id DESC LIMIT 5")
+    return cursor.fetchall()
+
+def get_folder_stats_by_day(conn, hostname):
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT DATE(timestamp) as date, folder_path, file_count
+        FROM folder_stats
+        WHERE hostname = ?
+        ORDER BY DATE(timestamp) DESC
+    """, (hostname,))
+    results = cursor.fetchall()
+    return pd.DataFrame(results, columns=["Date", "Folder Path", "File Count"])
+
+# SSH command-based data collection with modification time
+def collect_folder_data_ssh(ssh, path, extensions=None):
+    try:
+        command = f"find {path} -type f"
+        if extensions:
+            ext_filter = " -o ".join(f"-name '*{ext}'" for ext in extensions)
+            command += f" \\( {ext_filter} \\)"
+        command += " -exec stat --format='%Y %n|%s' {} \\;"  # %Y is Unix timestamp of last modification
+        st.write(f"Executing SSH command: {command}")
+        stdin, stdout, stderr = ssh.exec_command(command)
+        output = stdout.read().decode().strip().split("\n")
+        error = stderr.read().decode().strip()
+        if error:
+            st.error(f"SSH command error: {error}")
+            return pd.DataFrame(), {}, None
+        
+        folder_summary = {}
+        file_details = []
+        folder_stats = {}  # To store folder counts by modification date
+        for line in output:
+            if not line:
+                continue
+            try:
+                mod_time, full_path_size = line.split(" ", 1)
+                full_path, size = full_path_size.split("|")
+                size_kb = round(int(size) / 1024.0, 2)
+                folder = "/".join(full_path.split("/")[:-1])
+                mod_date = datetime.fromtimestamp(int(mod_time)).strftime("%Y-%m-%d")
+                file_details.append({
+                    "Folder Path": folder,
+                    "File Name": full_path.split("/")[-1],
+                    "File Size (KB)": size_kb,
+                    "Modification Date": mod_date
+                })
+                if folder not in folder_summary:
+                    folder_summary[folder] = []
+                folder_summary[folder].append(size_kb)
+                # Count files per folder by modification date
+                if mod_date not in folder_stats:
+                    folder_stats[mod_date] = {}
+                if folder not in folder_stats[mod_date]:
+                    folder_stats[mod_date][folder] = 0
+                folder_stats[mod_date][folder] += 1
+            except (ValueError, IndexError) as e:
+                st.warning(f"Skipping invalid line: {line} (Error: {e})")
+                continue
+        
+        folder_summary_list = [
+            {
+                "Folder Path": folder,
+                "File Count": len(sizes),
+                "Min File Size (KB)": min(sizes) if sizes else 0,
+                "Max File Size (KB)": max(sizes) if sizes else 0
+            }
+            for folder, sizes in folder_summary.items()
+        ]
+        st.write(f"Collected {len(file_details)} files from SSH command")
+        return pd.DataFrame(folder_summary_list), pd.DataFrame(file_details), folder_stats
+    except Exception as e:
+        st.error(f"SSH command failed: {e}")
+        return pd.DataFrame(), pd.DataFrame(), {}
+
+# Main logic
+if connect_btn:
+    if not all([hostname, username, password, parent_path]):
+        st.error("Please fill in all connection details.")
+    else:
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        try:
+            st.info(f"Attempting to connect to {hostname}...")
+            ssh.connect(hostname, username=username, password=password)
+            st.success(f"Connected to {hostname}")
+            
+            with st.spinner("Fetching folder and file details..."):
+                folder_summary, file_details, folder_stats = collect_folder_data_ssh(ssh, parent_path, extensions)
+            
+            if not folder_summary.empty:
+                st.subheader("Folder Summary")
+                st.dataframe(folder_summary, use_container_width=True)
+                total_files = folder_summary["File Count"].sum()
+                min_size = folder_summary["Min File Size (KB)"].min() if not folder_summary.empty else 0
+                max_size = folder_summary["Max File Size (KB)"].max() if not folder_summary.empty else 0
+                st.metric("Total Files", f"{total_files}")
+                st.metric("Min File Size (KB)", f"{min_size}")
+                st.metric("Max File Size (KB)", f"{max_size}")
+                
+                conn = init_db()
+                save_snapshot(conn, hostname, total_files, min_size, max_size, folder_stats)
+                
+                st.subheader("Last 5 Snapshots")
+                snapshots = get_snapshots(conn)
+                if snapshots:
+                    df_snapshots = pd.DataFrame(snapshots, columns=["ID", "Timestamp", "HostName", "Total Files", "Min File Size (KB)", "Max File Size (KB)"])
+                    st.dataframe(df_snapshots, use_container_width=True)
+                
+                st.subheader("Folder File Counts by Date")
+                df_folder_stats = get_folder_stats_by_day(conn, hostname)
+                if not df_folder_stats.empty:
+                    st.dataframe(df_folder_stats, use_container_width=True)
+            
+            if not file_details.empty:
+                st.subheader("File Details")
+                st.dataframe(file_details, use_container_width=True)
+            else:
+                st.error("No data retrieved. Check path, permissions, or command availability (ensure 'find' and 'stat' are available on the server).")
+        
+        except Exception as e:
+            if "getaddrinfo failed" in str(e).lower():
+                st.error(f"Connection failed: Unable to resolve hostname '{hostname}'. Please check for typos, ensure the server is online, or use an IP address instead. Test with 'ping {hostname}' or 'nslookup {hostname}' from a terminal.")
+            else:
+                st.error(f"Connection failed: {e}")
+        finally:
+            ssh.close()
