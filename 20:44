@@ -1,0 +1,248 @@
+import streamlit as st
+import paramiko
+import sqlite3
+import pandas as pd
+from datetime import datetime, timedelta
+
+st.set_page_config(page_title="Remote File Counts Viewer", layout="wide")
+st.title("Remote File Counts Viewer (SSH Command)")
+
+# Initialize session state
+if 'data_loaded' not in st.session_state:
+    st.session_state.data_loaded = False
+if 'current_hostname' not in st.session_state:
+    st.session_state.current_hostname = None
+if 'current_run_date' not in st.session_state:
+    st.session_state.current_run_date = None
+
+# Sidebar
+st.sidebar.header("Connect to Remote Server")
+hostname = st.sidebar.text_input("Hostname", placeholder="Enter hostname")
+username = st.sidebar.text_input("Username", placeholder="Enter username")
+password = st.sidebar.text_input("Password", placeholder="Enter password", type="password")
+parent_path = st.sidebar.text_input("Parent Directory", placeholder="Enter parent directory (e.g., /var/log)")
+connect_btn = st.sidebar.button("Connect and Fetch Data")
+
+# Database functions
+def init_db():
+    with sqlite3.connect("file_counts.db", timeout=10) as conn:
+        cursor = conn.cursor()
+        # Create folder_counts table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS folder_counts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                hostname TEXT,
+                folder_path TEXT,
+                run_date TEXT,
+                file_count INTEGER,
+                UNIQUE(hostname, folder_path, run_date) ON CONFLICT REPLACE
+            )
+        """)
+        # Create file_details table with file_size column
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS file_details (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                hostname TEXT,
+                file_path TEXT,
+                run_date TEXT,
+                file_size INTEGER,
+                UNIQUE(hostname, file_path, run_date) ON CONFLICT REPLACE
+            )
+        """)
+        conn.commit()
+    return sqlite3.connect("file_counts.db", timeout=10)
+
+def save_folder_counts(conn, hostname, folder_counts, run_date):
+    with conn:
+        cursor = conn.cursor()
+        for folder, count in folder_counts.items():
+            cursor.execute("INSERT INTO folder_counts (hostname, folder_path, run_date, file_count) VALUES (?, ?, ?, ?)",
+                          (hostname, folder, run_date, count))
+        conn.commit()
+    st.write(f"Saved {len(folder_counts)} folder counts for {run_date}")
+
+def save_file_details(conn, hostname, file_paths_with_sizes, run_date):
+    with conn:
+        cursor = conn.cursor()
+        for file_path, size in file_paths_with_sizes.items():
+            cursor.execute("INSERT INTO file_details (hostname, file_path, run_date, file_size) VALUES (?, ?, ?, ?)",
+                          (hostname, file_path, run_date, size))
+        conn.commit()
+    st.write(f"Saved {len(file_paths_with_sizes)} file details for {run_date}")
+
+def get_folder_counts_table(conn, hostname):
+    cursor = conn.cursor()
+    cursor.execute("SELECT DISTINCT folder_path FROM folder_counts WHERE hostname = ?", (hostname,))
+    all_folders = [row[0] for row in cursor.fetchall()]
+    if not all_folders:
+        return pd.DataFrame()
+
+    cursor.execute("SELECT DISTINCT run_date FROM folder_counts WHERE hostname = ? ORDER BY run_date DESC LIMIT 5", (hostname,))
+    date_rows = cursor.fetchall()
+    date_range = [row[0] for row in date_rows]
+
+    data = []
+    for folder in all_folders:
+        row = [folder]
+        for date in date_range:
+            cursor.execute("SELECT file_count FROM folder_counts WHERE hostname = ? AND folder_path = ? AND run_date = ?",
+                          (hostname, folder, date))
+            count = cursor.fetchone()
+            row.append(count[0] if count else 0)
+        data.append(row)
+    
+    columns = ["Folder Path"] + [date.strftime("%d %b %Y") for date in pd.to_datetime(date_range)]
+    return pd.DataFrame(data, columns=columns)
+
+def get_folder_summary(conn, hostname, run_date):
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT folder_path, file_count 
+        FROM folder_counts 
+        WHERE hostname = ? AND run_date = ?""", (hostname, run_date))
+    rows = cursor.fetchall()
+    if not rows:
+        return pd.DataFrame()
+    
+    data = {"Folder Path": [], "File Count": []}
+    for folder, count in rows:
+        data["Folder Path"].append(folder)
+        data["File Count"].append(count)
+    return pd.DataFrame(data)
+
+def get_available_dates(conn, hostname):
+    cursor = conn.cursor()
+    cursor.execute("SELECT DISTINCT run_date FROM file_details WHERE hostname = ? ORDER BY run_date DESC", (hostname,))
+    return [row[0] for row in cursor.fetchall()]
+
+def get_file_details_for_date(conn, hostname, selected_date):
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT file_path, file_size 
+        FROM file_details 
+        WHERE hostname = ? AND run_date = ?""", (hostname, selected_date))
+    rows = cursor.fetchall()
+    if not rows:
+        return pd.DataFrame()
+
+    data = {"File Path": [], "File Size (bytes)": []}
+    for file_path, size in rows:
+        data["File Path"].append(file_path)
+        data["File Size (bytes)"].append(size if size is not None else 0)
+    return pd.DataFrame(data)
+
+# SSH command-based data collection
+def collect_data_ssh(ssh, path):
+    try:
+        # Use find with stat to get file sizes (assuming stat is available; fallback to ls if needed)
+        command = f"find '{path}' -type f -exec stat -c '%n %s' {{}} \\; 2>/dev/null"
+        st.write(f"Executing SSH command: {command}")
+        stdin, stdout, stderr = ssh.exec_command(command)
+        output = stdout.read().decode().strip().split("\n")
+        error = stderr.read().decode().strip()
+        
+        if error:
+            st.error(f"SSH command error (stderr): {error}")
+            # Fallback to find only if stat fails
+            command = f"find '{path}' -type f 2>/dev/null"
+            st.write(f"Fallback SSH command: {command}")
+            stdin, stdout, stderr = ssh.exec_command(command)
+            output = stdout.read().decode().strip().split("\n")
+            error = stderr.read().decode().strip()
+            if error:
+                st.error(f"Fallback command error (stderr): {error}")
+                st.write(f"Fallback command output (stdout): {output}")
+                return None, None
+
+        folder_counts = {}
+        file_paths_with_sizes = {}
+        for line in output:
+            if line:
+                if 'stat' in command:  # Parse stat output (path and size)
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        file_path = " ".join(parts[:-1])  # Reconstruct path
+                        size = int(parts[-1])  # Last part is size in bytes
+                        file_paths_with_sizes[file_path] = size
+                        folder = "/".join(file_path.strip().split("/")[:-1]) or "/"
+                        folder_counts[folder] = folder_counts.get(folder, 0) + 1
+                else:  # Fallback: only path, size will be None
+                    file_paths_with_sizes[line] = None
+                    folder = "/".join(line.strip().split("/")[:-1]) or "/"
+                    folder_counts[folder] = folder_counts.get(folder, 0) + 1
+        
+        st.write(f"Collected {len(file_paths_with_sizes)} files across {len(folder_counts)} folders")
+        return folder_counts, file_paths_with_sizes
+    except Exception as e:
+        st.error(f"SSH command failed: {e}. Check path, permissions, or ensure 'find' and 'stat' are available on the server.")
+        return None, None
+
+# Main logic
+if connect_btn:
+    if not all([hostname, username, password, parent_path]):
+        st.error("Please fill in all connection details.")
+    else:
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        try:
+            st.info(f"Attempting to connect to {hostname}...")
+            ssh.connect(hostname, username=username, password=password)
+            st.success(f"Connected to {hostname}")
+            
+            with st.spinner("Fetching data..."):
+                folder_counts, file_paths_with_sizes = collect_data_ssh(ssh, parent_path)
+            
+            if folder_counts and file_paths_with_sizes:
+                conn = init_db()
+                run_date = datetime.now().strftime("%Y-%m-%d")
+                save_folder_counts(conn, hostname, folder_counts, run_date)
+                save_file_details(conn, hostname, file_paths_with_sizes, run_date)
+                conn.close()
+                
+                # Update session state
+                st.session_state.data_loaded = True
+                st.session_state.current_hostname = hostname
+                st.session_state.current_run_date = run_date
+        
+        except Exception as e:
+            if "getaddrinfo failed" in str(e).lower():
+                st.error(f"Connection failed: Unable to resolve hostname '{hostname}'. Please check for typos, ensure the server is online, or use an IP address. Test with 'ping {hostname}' or 'nslookup {hostname}'.")
+            else:
+                st.error(f"Connection failed: {e}")
+        finally:
+            ssh.close()
+
+# Display data if available
+if st.session_state.data_loaded and st.session_state.current_hostname:
+    conn = init_db()
+    
+    st.subheader("Folder File Counts by Date")
+    df_folder_counts = get_folder_counts_table(conn, st.session_state.current_hostname)
+    if not df_folder_counts.empty:
+        st.dataframe(df_folder_counts, use_container_width=True)
+    else:
+        st.warning("No folder counts available yet. This is the first run; data will build up over time.")
+
+    st.subheader("Folder Summary")
+    df_folder_summary = get_folder_summary(conn, st.session_state.current_hostname, st.session_state.current_run_date)
+    if not df_folder_summary.empty:
+        st.dataframe(df_folder_summary, use_container_width=True)
+    else:
+        st.warning("No folder summary available for this run.")
+
+    st.subheader("File Details")
+    available_dates = get_available_dates(conn, st.session_state.current_hostname)
+    
+    if available_dates:
+        selected_date = st.selectbox("Select Date for File Details", available_dates, index=0)
+        df_file_details = get_file_details_for_date(conn, st.session_state.current_hostname, selected_date)
+        
+        if not df_file_details.empty:
+            st.dataframe(df_file_details, use_container_width=True)
+            st.write(f"Displaying {len(df_file_details)} files for {selected_date}")
+        else:
+            st.warning(f"No file details available for {selected_date}.")
+    else:
+        st.warning("No file details available yet.")
+    
+    conn.close()
