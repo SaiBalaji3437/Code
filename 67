@@ -1,0 +1,118 @@
+# ------------------- Multi-Day Comparison (Day-by-Day) -------------------
+st.markdown("---")
+st.subheader("Day-by-Day File Changes (Added / Deleted)")
+
+if not st.session_state.get("data_loaded") or not st.session_state.get("current_hostname"):
+    st.info("Connect to a server and fetch data first.")
+else:
+    conn = init_db()
+    hostname = st.session_state.current_hostname
+    available_dates = get_available_dates(conn, hostname)
+
+    if len(available_dates) < 2:
+        st.info("Need at least **two** different run dates to compare.")
+        conn.close()
+    else:
+        # --------------------------------------------------------------
+        # 1. UI – pick start / end
+        # --------------------------------------------------------------
+        start_date = st.selectbox(
+            "Start Date", available_dates, index=0, key="cmp_start"
+        )
+        end_date = st.selectbox(
+            "End Date", available_dates, index=len(available_dates)-1, key="cmp_end"
+        )
+
+        # --------------------------------------------------------------
+        # 2. Validate range
+        # --------------------------------------------------------------
+        if available_dates.index(start_date) >= available_dates.index(end_date):
+            st.warning("End Date must be **after** Start Date.")
+        else:
+            # --------------------------------------------------------------
+            # 3. Build the day-by-day diff
+            # --------------------------------------------------------------
+            with st.spinner("Scanning every day…"):
+                # Sort dates just in case they are not in order
+                all_dates = sorted(available_dates)
+                start_idx = all_dates.index(start_date)
+                end_idx   = all_dates.index(end_date)
+                date_range = all_dates[start_idx : end_idx + 1]
+
+                # Containers for the final report
+                changes_by_date = []          # list of dicts for the summary table
+                added_details   = {}          # date → list of added paths
+                deleted_details = {}          # date → list of deleted paths
+
+                # Start with the snapshot of the *first* day
+                previous_set = get_file_paths_set(conn, hostname, date_range[0])
+
+                for i in range(1, len(date_range)):
+                    today = date_range[i]
+                    today_set = get_file_paths_set(conn, hostname, today)
+
+                    added_today   = today_set   - previous_set
+                    deleted_today = previous_set - today_set
+
+                    # Store for the detailed view
+                    if added_today:
+                        added_details[today] = sorted(added_today)
+                    if deleted_today:
+                        deleted_details[today] = sorted(deleted_today)
+
+                    # Summary row
+                    changes_by_date.append({
+                        "Date"      : today,
+                        "Added"     : len(added_today),
+                        "Deleted"   : len(deleted_today)
+                    })
+
+                    # Move forward
+                    previous_set = today_set
+
+                # Convert to DataFrame for nice display
+                summary_df = pd.DataFrame(changes_by_date)
+
+            # --------------------------------------------------------------
+            # 4. Show results
+            # --------------------------------------------------------------
+            total_days = len(date_range) - 1
+            st.success(
+                f"**{start_date} → {end_date}** – {total_days} day(s) analysed  "
+                f"({summary_df['Added'].sum()} added, {summary_df['Deleted'].sum()} deleted)"
+            )
+
+            # ---- Summary table (Date | Added | Deleted) ----
+            st.subheader("Summary per Day")
+            st.dataframe(summary_df, use_container_width=True)
+
+            # ---- Detailed lists (expanders) ----
+            if added_details or deleted_details:
+                st.subheader("Detailed Changes")
+
+                for d in date_range[1:]:          # skip the very first day (no diff)
+                    col_a, col_d = st.columns(2)
+
+                    with col_a:
+                        if d in added_details:
+                            with st.expander(f"Added on {d} ({len(added_details[d])})"):
+                                st.dataframe(
+                                    pd.DataFrame(added_details[d], columns=["File Path"]),
+                                    use_container_width=True
+                                )
+                        else:
+                            st.caption(f"**{d}** – no files added")
+
+                    with col_d:
+                        if d in deleted_details:
+                            with st.expander(f"Deleted on {d} ({len(deleted_details[d])})"):
+                                st.dataframe(
+                                    pd.DataFrame(deleted_details[d], columns=["File Path"]),
+                                    use_container_width=True
+                                )
+                        else:
+                            st.caption(f"**{d}** – no files deleted")
+            else:
+                st.info("No file changes detected in the selected range.")
+
+    conn.close()
