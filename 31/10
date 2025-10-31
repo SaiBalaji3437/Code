@@ -1,0 +1,56 @@
+# ---------------- Multi-Day Comparison Section ----------------
+st.markdown("---")
+st.subheader("📆 Multi-Day Comparison")
+
+if available_dates:
+    # Let user pick a range of days (start and end)
+    start_date = st.selectbox("Start Date", available_dates, index=0)
+    end_date = st.selectbox("End Date", available_dates, index=len(available_dates)-1)
+
+    # Only compare if start < end
+    if available_dates.index(start_date) < available_dates.index(end_date):
+        # Gather all dates between start and end
+        start_idx = available_dates.index(start_date)
+        end_idx = available_dates.index(end_date)
+        date_range = available_dates[start_idx:end_idx + 1]
+
+        # Get file paths as sets
+        def get_file_paths_set(conn, hostname, date):
+            df = get_file_details_for_date(conn, st.session_state.current_hostname, date)
+            if df.empty:
+                return set()
+            return set(df["File Path"])
+
+        # Build cumulative file sets
+        old_files = get_file_paths_set(conn, st.session_state.current_hostname, start_date)
+        new_files = old_files.copy()  # Start with files from start_date
+
+        # Union all subsequent dates
+        for d in date_range[1:]:
+            current_files = get_file_paths_set(conn, st.session_state.current_hostname, d)
+            new_files |= current_files  # Now works: set |= set
+
+        added_files = new_files - old_files
+        removed_files = old_files - new_files
+
+        st.info(f"Comparing changes from **{start_date} → {end_date}** (across {len(date_range)} days)")
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.markdown(f"**Files Added over {len(date_range)} days:**")
+            if added_files:
+                st.dataframe(pd.DataFrame(sorted(list(added_files)), columns=["File Path"]), use_container_width=True)
+            else:
+                st.info("No new files added during this period.")
+
+        with col2:
+            st.markdown(f"**Files Removed over {len(date_range)} days:**")
+            if removed_files:
+                st.dataframe(pd.DataFrame(sorted(list(removed_files)), columns=["File Path"]), use_container_width=True)
+            else:
+                st.info("No files removed during this period.")
+    else:
+        st.warning("Please choose a valid date range where end date is after start date.")
+else:
+    st.info("No dates available for comparison yet.")
